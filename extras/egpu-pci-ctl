@@ -1,0 +1,53 @@
+#!/bin/bash
+# Root helper for the lucky.egpu Omarchy plugin. Installed to
+# /usr/local/libexec/egpu-pci-ctl and allowed for wheel without a password by
+# /etc/sudoers.d/egpu-eject. It takes no device arguments: it only ever acts
+# on the removable (Thunderbolt/USB4) display controller it finds itself.
+#   status   print gpu=<addr> top=<addr of the external PCIe subtree root>
+#   remove   remove that whole external subtree (GPU, its audio, enclosure bridges)
+#   rescan   rescan the PCI bus so a still-plugged eGPU comes back
+set -euo pipefail
+export PATH=/usr/bin
+
+find_gpu() {
+  local d
+  for d in /sys/bus/pci/devices/*; do
+    [[ -f $d/class && $(<"$d/class") == 0x03* ]] || continue
+    [[ -f $d/removable && $(<"$d/removable") == removable ]] || continue
+    readlink -f "$d"; return 0
+  done
+  return 1
+}
+
+# Walk up while the parent is still a removable PCI device: the top of that
+# chain is the enclosure's upstream port, whose removal takes the whole eGPU.
+top_of() {
+  local cur=$1 parent
+  while :; do
+    parent=$(dirname "$cur")
+    [[ $(basename "$parent") =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]] || break
+    [[ -f $parent/removable && $(<"$parent/removable") == removable ]] || break
+    cur=$parent
+  done
+  echo "$cur"
+}
+
+case ${1:-} in
+  status)
+    gpu=$(find_gpu) || { echo "gpu="; exit 0; }
+    echo "gpu=$(basename "$gpu")"
+    echo "top=$(basename "$(top_of "$gpu")")"
+    ;;
+  remove)
+    gpu=$(find_gpu) || { echo "no removable GPU found" >&2; exit 1; }
+    top=$(top_of "$gpu")
+    [[ -f $top/removable && $(<"$top/removable") == removable ]] || { echo "refusing: $top is not removable" >&2; exit 1; }
+    logger -t egpu-eject "removing external PCI subtree $(basename "$top") (GPU $(basename "$gpu"))"
+    echo 1 > "$top/remove"
+    ;;
+  rescan)
+    logger -t egpu-eject "rescanning PCI bus"
+    echo 1 > /sys/bus/pci/rescan
+    ;;
+  *) echo "usage: egpu-pci-ctl status|remove|rescan" >&2; exit 2 ;;
+esac

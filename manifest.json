@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "lucky.egpu",
+  "name": "eGPU",
+  "version": "0.1.0",
+  "author": "Luke Williams",
+  "license": "MIT",
+  "description": "Thunderbolt eGPU status, one-click safe eject, and run-on-eGPU launching.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "eGPU",
+    "description": "Shows while an eGPU is attached; click to eject it safely, right-click for the eGPU menu",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

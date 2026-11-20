@@ -1,0 +1,297 @@
+#!/bin/bash
+# egpu: status, offload launcher, and safe eject for a Thunderbolt/USB4 eGPU.
+# Part of the lucky.egpu Omarchy plugin (~/.config/omarchy/plugins/lucky.egpu).
+#
+#   egpu status [--json|--notify] attached / ejected / absent, plus who drives it
+#   egpu run <cmd> [args...]    run one app on the eGPU (Mesa PRIME offload)
+#   egpu run-picker             pick an installed app and run it on the eGPU
+#   egpu holders                list processes holding the eGPU's DRM nodes
+#   egpu eject [--dry-run] [--yes|--close-apps]
+#                               prepare the eGPU for unplugging
+#   egpu reattach               bring an ejected (still plugged) eGPU back
+#
+# Privileged steps go through /usr/local/libexec/egpu-pci-ctl via the narrow
+# sudoers rule in /etc/sudoers.d/egpu-eject.
+set -uo pipefail
+
+HELPER=/usr/local/libexec/egpu-pci-ctl
+STATE=${XDG_RUNTIME_DIR:-/tmp}/egpu-ejected
+ICON=$'\U000f08ae'   # nf-md-expansion_card
+
+notify() {
+  if command -v omarchy-notification-send >/dev/null 2>&1; then
+    omarchy-notification-send "$@" >/dev/null 2>&1 || notify-send "$@" 2>/dev/null || true
+  else
+    notify-send "$@" 2>/dev/null || true
+  fi
+}
+
+graphical() { [[ -n ${WAYLAND_DISPLAY:-} && ! -t 0 ]]; }
+
+# Print "<card sysfs> <pci sysfs>" for the removable display GPU, if any.
+find_gpu() {
+  local c base dev
+  for c in /sys/class/drm/card[0-9]*; do
+    base=${c##*/}
+    [[ $base == *-* ]] && continue
+    [[ -f $c/device/removable && $(<"$c/device/removable") == removable && -f $c/device/class ]] || continue
+    [[ $(<"$c/device/class") == 0x03* ]] || continue
+    dev=$(readlink -f "$c/device" 2>/dev/null) || continue
+    echo "$c $dev"
+    return 0
+  done
+  return 1
+}
+
+gpu_vars() {
+  local line
+  line=$(find_gpu) || return 1
+  CARD_SYS=${line%% *}; PCI_SYS=${line#* }
+  PCI=${PCI_SYS##*/}
+  CARD=/dev/dri/${CARD_SYS##*/}
+  RENDER=$(readlink -f "/dev/dri/by-path/pci-$PCI-render" 2>/dev/null || true)
+  VENDOR=$(<"$PCI_SYS/vendor"); DEVICE=$(<"$PCI_SYS/device")
+  local cache="${XDG_RUNTIME_DIR:-/tmp}/egpu-name-$PCI"
+  local key="$VENDOR:$DEVICE" ckey="" cname=""
+  if [[ -r $cache ]] && IFS=$'\t' read -r ckey cname <"$cache" && [[ $ckey == "$key" && -n $cname ]]; then
+    NAME=$cname
+  else
+    NAME=$(lspci -s "${PCI#0000:}" 2>/dev/null | sed 's/^[^ ]* [^:]*: //; s/ (rev [0-9a-f]*)$//' || true)
+    # "Advanced Micro Devices, Inc. [AMD/ATI] Navi 23 [Radeon RX 6600/6600 XT/6600M]" -> last bracket
+    local short; short=$(grep -o '\[[^]]*\]' <<<"$NAME" | tail -1 | tr -d '[]')
+    [[ -n $short ]] && NAME=$short
+    [[ -n $NAME ]] || NAME="GPU $PCI"
+    printf '%s\t%s\n' "$key" "$NAME" >"$cache" 2>/dev/null || true
+  fi
+  local drv_link
+  drv_link=$(readlink "$PCI_SYS/driver" 2>/dev/null || true)
+  DRIVER=${drv_link##*/}
+}
+
+# Thunderbolt peripherals currently attached (by sysfs path), for the ejected state.
+tb_present() { [[ -n ${1:-} && -e $1 ]]; }
+
+# pid<TAB>comm for every process holding the eGPU card or render node.
+holders() {
+  local args=() f pid t comm
+  [[ -n ${CARD:-} ]] && args+=(-lname "$CARD")
+  [[ -n ${RENDER:-} ]] && { (( ${#args[@]} )) && args+=(-o); args+=(-lname "$RENDER"); }
+  (( ${#args[@]} )) || return 0
+  find /proc/[0-9]*/fd -maxdepth 1 \( "${args[@]}" \) 2>/dev/null |
+    while read -r f; do
+      pid=${f#/proc/}; pid=${pid%%/*}
+      [[ $pid == "$$" || $pid == "$BASHPID" ]] && continue
+      t=$(readlink "$f" 2>/dev/null) || continue
+      comm=$(<"/proc/$pid/comm") 2>/dev/null || comm=""
+      printf '%s\t%s\t%s\n' "$pid" "$comm" "${t##*/}"
+    done | sort -u -t$'\t' -k1,1
+}
+
+compositor_holds() {
+  local pids=() dirs=() pid
+  mapfile -t pids < <(pgrep -x Hyprland)
+  for pid in "${pids[@]}"; do
+    [[ -d /proc/$pid/fd ]] && dirs+=("/proc/$pid/fd")
+  done
+  (( ${#dirs[@]} )) || return 1
+  [[ -n $(find "${dirs[@]}" -maxdepth 1 -lname "$CARD" -print -quit 2>/dev/null) ]]
+}
+
+# Connected outputs on the eGPU, as Hyprland names them (card3-DP-11 -> DP-11).
+egpu_outputs() {
+  local card_base=${CARD_SYS##*/} s
+  for s in "$CARD_SYS"/"$card_base"-*; do
+    [[ -f $s/status && $(<"$s/status") == connected ]] || continue
+    s=${s##*/}; echo "${s#*-}"
+  done
+}
+
+cmd_status() {
+  local json=0; [[ ${1:-} == --json ]] && json=1
+  local state=absent comp=false outs="" ejected_tb=""
+  if gpu_vars; then
+    state=attached
+    compositor_holds && comp=true
+    local card_base=${CARD_SYS##*/} s
+    for s in "$CARD_SYS"/"$card_base"-*; do
+      [[ -f $s/status && $(<"$s/status") == connected ]] || continue
+      s=${s##*/}
+      outs+="${outs:+,}${s#*-}"
+    done
+    [[ -e $STATE ]] && rm -f "$STATE"
+  elif [[ -f $STATE ]]; then
+    ejected_tb=$(<"$STATE")
+    if tb_present "$ejected_tb"; then state=ejected; else rm -f "$STATE"; fi
+  fi
+  if (( json )); then
+    jq -cn --arg state "$state" --arg pci "${PCI:-}" --arg name "${NAME:-}" \
+      --arg driver "${DRIVER:-}" --arg card "${CARD:-}" --arg render "${RENDER:-}" \
+      --argjson compositor "$comp" --arg outputs "$outs" \
+      '{state:$state,pci:$pci,name:$name,driver:$driver,card:$card,render:$render,compositorUsesIt:$compositor,outputs:($outputs|split(",")|map(select(.!="")))}'
+  else
+    case $state in
+      attached)
+        echo "eGPU attached: $NAME ($PCI, $DRIVER)"
+        echo "  nodes: $CARD ${RENDER:-}"
+        echo "  connected outputs: ${outs:-none}"
+        if [[ $comp == true ]]; then echo "  Hyprland is using it for display (eject would crash the session)"
+        else echo "  Hyprland is not using it (offload only)"; fi
+        ;;
+      ejected) echo "eGPU ejected: safe to unplug (or run 'egpu reattach')" ;;
+      absent) echo "No eGPU attached" ;;
+    esac
+  fi
+}
+
+offload_env() {
+  # Mesa PRIME offload: GL via DRI_PRIME, Vulkan via the device-select layer.
+  local tag=pci-${PCI//[:.]/_}
+  export DRI_PRIME=$tag
+  export MESA_VK_DEVICE_SELECT=${VENDOR#0x}:${DEVICE#0x}
+  export MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE=1
+  case $DRIVER in
+    nvidia) export __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia __VK_LAYER_NV_optimus=NVIDIA_only ;;
+  esac
+}
+
+cmd_run() {
+  (( $# )) || { echo "usage: egpu run <command> [args...]" >&2; exit 2; }
+  if ! gpu_vars; then
+    notify "eGPU" "No eGPU attached; starting $1 on the laptop GPU"
+    exec "$@"
+  fi
+  offload_env
+  exec "$@"
+}
+
+cmd_run_picker() {
+  gpu_vars || { notify "eGPU" "No eGPU attached"; exit 1; }
+  local dirs=() d f rows="" name nodisp id choice
+  IFS=: read -ra dirs <<<"${XDG_DATA_HOME:-$HOME/.local/share}:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+  declare -A seen=()
+  for d in "${dirs[@]}"; do
+    for f in "$d"/applications/*.desktop; do
+      [[ -f $f ]] || continue
+      id=$(basename "$f")
+      [[ -n ${seen[$id]:-} ]] && continue
+      seen[$id]=1
+      nodisp=$(grep -m1 -E '^(NoDisplay|Hidden)=true' "$f" || true)
+      [[ -n $nodisp ]] && continue
+      grep -q -m1 '^Type=Application' "$f" || continue
+      name=$(grep -m1 '^Name=' "$f" | cut -d= -f2-)
+      [[ -n $name ]] || continue
+      rows+="$ICON"$'\t'"$name"$'\t'"${id%.desktop}"$'\n'
+    done
+  done
+  mapfile -t opts < <(printf '%s' "$rows" | sort -t$'\t' -k2,2f)
+  choice=$(omarchy-menu-select "Run on eGPU" "${opts[@]}" -- --width 520) || exit 0
+  [[ -n $choice ]] || exit 0
+  id=${choice##*$'\t'}
+  offload_env
+  exec uwsm-app -- "$id.desktop"
+}
+
+cmd_holders() {
+  gpu_vars || { echo "No eGPU attached"; return 0; }
+  holders | sort -k2,2 -u -t$'\t'
+}
+
+cmd_eject() {
+  local dry=0 mode=ask
+  while (( $# )); do
+    case $1 in
+      --dry-run|-n) dry=1 ;;
+      --yes|-y) mode=yes ;;
+      --close-apps) mode=close ;;
+      *) echo "unknown option $1" >&2; exit 2 ;;
+    esac; shift
+  done
+  if ! gpu_vars; then
+    [[ -f $STATE ]] && { notify "eGPU" "Already ejected. Safe to unplug."; echo "already ejected"; exit 0; }
+    notify "eGPU" "No eGPU attached"; echo "No eGPU attached"; exit 0
+  fi
+  echo "eGPU: $NAME ($PCI)"
+  if compositor_holds; then
+    local outs; outs=$(egpu_outputs | paste -sd, -)
+    local msg="Hyprland is driving the eGPU (outputs: ${outs:-none}). Ejecting now would crash your session. Reboot once so the offload-only rule takes effect, and plug that monitor into the dock or laptop."
+    echo "REFUSING: $msg"
+    (( dry )) || notify -u critical "eGPU: can't eject safely" "$msg"
+    exit 3
+  fi
+  local list apps
+  list=$(holders)
+  apps=$(printf '%s\n' "$list" | awk -F'\t' 'NF{print $2}' | sort -u | paste -sd, - | sed 's/,/, /g')
+  if [[ -n $list ]]; then
+    echo "Processes holding the eGPU:"; printf '%s\n' "$list" | sed 's/^/  /'
+  else
+    echo "No processes hold the eGPU."
+  fi
+  local top
+  top=$(sudo -n "$HELPER" status 2>/dev/null | awk -F= '/^top=/{print $2}')
+  echo "Would remove PCI subtree at ${top:-?} (then notify 'Safe to unplug')."
+  if (( dry )); then echo "dry run: nothing changed"; exit 0; fi
+
+  if [[ -n $list && $mode == ask ]]; then
+    if graphical; then
+      local c
+      c=$(omarchy-menu-select "eGPU in use by: $apps" \
+            "$ICON"$'\t'"Eject anyway"$'\t'"apps lose the eGPU and fall back or restart their GPU process" \
+            $'\U000f0156'$'\t'"Close these apps, then eject" \
+            $'\U000f0156'$'\t'"Cancel" -- --width 560) || exit 0
+      case $c in
+        "Eject anyway"*) mode=yes ;;
+        "Close these apps"*) mode=close ;;
+        *) echo "cancelled"; exit 0 ;;
+      esac
+    else
+      echo "Re-run with --yes to eject anyway, or --close-apps to close them first." >&2
+      exit 1
+    fi
+  fi
+  if [[ $mode == close && -n $list ]]; then
+    local pids; pids=$(printf '%s\n' "$list" | awk -F'\t' 'NF{print $1}')
+    kill -TERM $pids 2>/dev/null || true
+    for _ in {1..10}; do sleep 0.5; [[ -z $(holders) ]] && break; done
+  fi
+
+  # Remember which Thunderbolt device carried the GPU, so status can show
+  # "ejected" until it is physically unplugged.
+  local tb=""
+  for t in /sys/bus/thunderbolt/devices/*/device_name; do
+    [[ -e $t ]] || continue
+    if grep -qi -E 'gpu|graphics' "$t"; then tb=$(dirname "$t"); break; fi
+  done
+
+  if ! sudo -n "$HELPER" remove; then
+    notify -u critical "eGPU" "Eject failed; see 'egpu eject' in a terminal"
+    exit 1
+  fi
+  [[ -n $tb ]] && echo "$tb" >"$STATE" || : >"$STATE"
+  notify "eGPU ejected" "Safe to unplug."
+  echo "Safe to unplug."
+}
+
+cmd_reattach() {
+  if gpu_vars; then echo "eGPU already attached"; exit 0; fi
+  sudo -n "$HELPER" rescan || { notify "eGPU" "Reattach failed"; exit 1; }
+  sleep 2
+  rm -f "$STATE"
+  if gpu_vars; then notify "eGPU" "eGPU is back: $NAME"; echo "reattached"; else notify "eGPU" "No eGPU found after rescan; is it plugged in?"; exit 1; fi
+}
+
+case ${1:-status} in
+  status)
+    shift || true
+    if [[ ${1:-} == --notify ]]; then
+      out=$(cmd_status); notify "eGPU" "$out"; printf '%s\n' "$out"
+    else
+      cmd_status "$@"
+    fi ;;
+  run) shift; cmd_run "$@" ;;
+  run-picker) cmd_run_picker ;;
+  holders) cmd_holders ;;
+  eject) shift; cmd_eject "$@" ;;
+  reattach) cmd_reattach ;;
+  -h|--help|help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) echo "unknown command: $1 (try egpu help)" >&2; exit 2 ;;
+esac

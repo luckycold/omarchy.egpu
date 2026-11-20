@@ -1,0 +1,3 @@
+# lucky.egpu Omarchy plugin: let wheel users eject/reattach the Thunderbolt eGPU
+# without a password. The helper takes no device arguments.
+%wheel ALL=(root) NOPASSWD: /usr/local/libexec/egpu-pci-ctl status, /usr/local/libexec/egpu-pci-ctl remove, /usr/local/libexec/egpu-pci-ctl rescan

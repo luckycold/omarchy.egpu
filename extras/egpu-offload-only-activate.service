@@ -1,0 +1,23 @@
+# lucky.egpu: installs the staged offload-only udev rule early in the next boot,
+# before udev coldplug, so it never changes a GPU Hyprland already holds.
+#
+# Order only against the root filesystem (where /etc and /usr/local live).
+# Never After=local-fs.target: /boot and /home wait for udev coldplug to create
+# their /dev/disk/by-uuid links, so local-fs.target + Before=udev-trigger is an
+# ordering loop that hangs boot for 90s and drops it to emergency mode.
+[Unit]
+Description=Activate eGPU offload-only udev rule (staged by lucky.egpu)
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=systemd-udev-trigger.service
+RequiresMountsFor=/etc/udev/rules.d /usr/local/share/egpu
+ConditionPathExists=/usr/local/share/egpu/72-egpu-offload-only.rules
+ConditionPathExists=!/etc/udev/rules.d/72-egpu-offload-only.rules
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/install -m644 /usr/local/share/egpu/72-egpu-offload-only.rules /etc/udev/rules.d/72-egpu-offload-only.rules
+ExecStartPost=-/usr/bin/udevadm control --reload
+
+[Install]
+WantedBy=sysinit.target

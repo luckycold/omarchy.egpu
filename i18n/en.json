@@ -1,0 +1,5 @@
+{
+  "tooltip.attached": "eGPU: %1\nClick to eject safely · right-click for menu",
+  "tooltip.compositor": "eGPU: %1\nHyprland is using it for display, so it can't be ejected until you reboot with the offload-only rule\nRight-click for menu",
+  "tooltip.ejected": "eGPU ejected: safe to unplug\nClick to reattach · right-click for menu"
+}

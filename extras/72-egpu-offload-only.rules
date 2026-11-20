@@ -1,0 +1,10 @@
+# lucky.egpu Omarchy plugin: keep the Thunderbolt/USB4 eGPU out of the
+# compositor so it can be ejected without crashing Hyprland.
+#
+# Aquamarine skips DRM cards whose ID_SEAT is not the session seat, and logind
+# refuses TakeDevice for them, so Hyprland never opens the eGPU's KMS node
+# (at login or on hotplug). Apps still render on it through its render node
+# (renderD*, mode 0666) with `egpu run`. Dropping master-of-seat stops logind
+# from creating a second seat (and a greeter) on the eGPU's outputs.
+# Monitors cabled to the eGPU's own ports stay dark; cable them to the dock or laptop.
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*", SUBSYSTEMS=="pci", ATTRS{removable}=="removable", ATTRS{class}=="0x03*", ENV{ID_SEAT}="seat-egpu", TAG-="master-of-seat"

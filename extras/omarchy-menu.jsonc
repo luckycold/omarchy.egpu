@@ -1,0 +1,7 @@
+  // lucky.egpu-menu-start
+  "egpu": {"icon":"󰢮","label":"eGPU","aliases":["egpu","gpu"],"description":"Eject, status, and run apps on the Thunderbolt eGPU"},
+  "egpu.eject": {"icon":"󰕓","label":"Eject eGPU","description":"Prepare the eGPU for unplugging","when":"$HOME/.config/omarchy/plugins/lucky.egpu/bin/egpu status --json | jq -e '.state==\"attached\"' >/dev/null","action":"$HOME/.config/omarchy/plugins/lucky.egpu/bin/egpu eject"},
+  "egpu.reattach": {"icon":"󰕒","label":"Reattach eGPU","description":"Bring an ejected, still-plugged eGPU back","when":"$HOME/.config/omarchy/plugins/lucky.egpu/bin/egpu status --json | jq -e '.state==\"ejected\"' >/dev/null","action":"$HOME/.config/omarchy/plugins/lucky.egpu/bin/egpu reattach"},
+  "egpu.status": {"icon":"󰋼","label":"Status","description":"Show whether the eGPU is attached and who is using it","action":"$HOME/.config/omarchy/plugins/lucky.egpu/bin/egpu status --notify"},
+  "egpu.run": {"icon":"󰐊","label":"Run app on eGPU","description":"Pick an installed app and start it on the eGPU","when":"$HOME/.config/omarchy/plugins/lucky.egpu/bin/egpu status --json | jq -e '.state==\"attached\"' >/dev/null","action":"$HOME/.config/omarchy/plugins/lucky.egpu/bin/egpu run-picker"}
+  // lucky.egpu-menu-end
